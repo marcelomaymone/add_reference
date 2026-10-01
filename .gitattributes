@@ -1,0 +1,5 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Scripts bash devem ter quebras de linha LF estritas
+*.sh text eol=lf
