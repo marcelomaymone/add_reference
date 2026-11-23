@@ -4,7 +4,20 @@ import re
 import json
 import argparse
 import subprocess
+import unicodedata
 from pathlib import Path
+
+# Assegura suporte robusto a UTF-8 em stdout e stderr (essencial no Windows)
+if hasattr(sys.stdout, "reconfigure"):
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+if hasattr(sys.stderr, "reconfigure"):
+    try:
+        sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
 
 def ensure_package(package_name, import_name=None):
     """Garante que um pacote Python esteja instalado silenciosamente."""
@@ -23,14 +36,17 @@ def ensure_package(package_name, import_name=None):
             sys.stderr.write(f"Aviso: Não foi possível instalar {package_name}: {e}\n")
 
 def to_snake_case_down(text):
-    """Converte um texto para o padrão snake_case_down (letras minúsculas e underscores)."""
+    """Converte um texto para o padrão snake_case_down (letras minúsculas e underscores sem acentos)."""
     text = Path(text).stem
+    text = unicodedata.normalize('NFKD', text).encode('ASCII', 'ignore').decode('utf-8')
     text = re.sub(r'[^\w\s-]', '', text).strip()
     text = re.sub(r'[\s-]+', '_', text)
     return text.lower()
 
 def clean_markdown_content(text):
     """Realiza limpeza inteligente do conteúdo extraído, eliminando marcadores de página e marcas d'água."""
+    # Remove BOM se presente
+    text = text.lstrip('\ufeff')
     # Remove form feeds
     text = text.replace('\x0c', '\n').replace('\f', '\n')
     
@@ -40,18 +56,48 @@ def clean_markdown_content(text):
     # Remove marcas d'água de bibliotecas digitais (ex: IEEE Xplore)
     text = re.sub(r'Authorized licensed use limited to:.*?(?:Restrictions apply\.?|$)', '', text, flags=re.IGNORECASE)
     
+    # Remove marcas d'água de plataformas de preview (ex: iTeh Standards Preview)
+    text = re.sub(r'iT\s*eh\s*ST\s*ANDARD\s*PREVIEW', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'\(standards\.iteh\.ai\)', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'https?://standards\.iteh\.ai[^\s]*', '', text, flags=re.IGNORECASE)
+    text = re.sub(r'[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}/[^\s]+', '', text, flags=re.IGNORECASE)
+    
     # Remove glifos residuais de fontes de PDF (ex: /g127, /g0)
     text = re.sub(r'/g\d+\s*', '', text)
     
     # Regex para identificar linhas que são estritamente indicadores de página ou números isolados
     page_line_regex = re.compile(
-        r'^\s*(?:[-–—]\s*)?(?:(?:Página|Page)\s*\d+(?:\s*(?:de|of|/)\s*\d+)?|\d+\s*(?:de|of|/)\s*\d+|(?:Página|Page)\s*\d+|\d{1,4})\s*(?:[-–—]\s*)?$',
+        r'^\s*(?:[-–—]\s*)?(?:(?:Página|Page)\s*\d+(?:\s*(?:de|of|/)\s*\d+)?|\d+\s*(?:de|of|/)\s*\d+|(?:Página|Page)\s*\d+|\d{1,4}|[ivxlcdm]{1,6})\s*(?:[-–—]\s*)?$',
         re.IGNORECASE
     )
     
     # Captura rodapés e cabeçalhos com referências a normas e números de página
     doc_page_footer_regex = re.compile(
         r'^\s*(?:ISO|IEC|IEEE|ABNT|NBR|RFC).*\b(?:Page|Página)\s*\d+\s*$',
+        re.IGNORECASE
+    )
+    
+    # Captura cabeçalho repetitivo isolado de topo de página
+    doc_header_regex = re.compile(
+        r'^\s*ISO/IEC/IEEE\s+15288:\d{4}\([A-Z]\)\s*$',
+        re.IGNORECASE
+    )
+    
+    # Captura cabeçalhos/rodapés correntes com paginação (ex: DAMA-DMBOK, livros técnicos)
+    running_header_regex = re.compile(
+        r'^\s*(?:\d{1,4}\s*[•\ufffd\-\–\—|]\s*(?:DMBOK2|[A-Z\s]{3,})|(?:DMBOK2|[A-Z\s]{3,})\s*[•\ufffd\-\–\—|]\s*\d{1,4})\s*$',
+        re.IGNORECASE
+    )
+    
+    # Captura indicadores de páginas de anexos como A - 1, B - 2, C - 1, E - 3, F - 1
+    annex_page_regex = re.compile(
+        r'^\s*[A-Z]\s*[-–—]\s*\d+\s*$',
+        re.IGNORECASE
+    )
+    
+    # Captura cabeçalhos de edição corrente como 'Edição Jun/2020', 'Edição Jul/2024'
+    edition_header_regex = re.compile(
+        r'^\s*Edi[çc][ãa]o\s+[A-Za-z]{3}/\d{4}\s*$',
         re.IGNORECASE
     )
     
@@ -69,7 +115,15 @@ def clean_markdown_content(text):
             stripped = stripped_copyright
             line = stripped_copyright
             
-        if page_line_regex.match(stripped) or doc_page_footer_regex.match(stripped):
+        if (page_line_regex.match(stripped) or 
+            doc_page_footer_regex.match(stripped) or 
+            doc_header_regex.match(stripped) or
+            running_header_regex.match(stripped) or
+            annex_page_regex.match(stripped) or
+            edition_header_regex.match(stripped) or
+            "standards.iteh.ai" in stripped.lower() or 
+            "c45ae8413981" in stripped.lower() or
+            "standards/sist/" in stripped.lower()):
             continue
         cleaned.append(line)
         
@@ -90,11 +144,22 @@ def convert_pdf(file_path):
     return "\n\n".join(text_content)
 
 def convert_docx(file_path):
-    """Extrai conteúdo de arquivo DOCX."""
+    """Extrai conteúdo de arquivo DOCX ou DOC."""
     ensure_package("python-docx", "docx")
     import docx
     
-    doc = docx.Document(file_path)
+    path_obj = Path(file_path)
+    actual_file_to_open = file_path
+    if path_obj.suffix.lower() == '.doc':
+        docx_path = path_obj.with_suffix('.docx')
+        if not docx_path.exists():
+            import subprocess
+            cmd = f'$w = New-Object -ComObject Word.Application; $w.Visible = $false; $d = $w.Documents.Open("{path_obj.resolve()}"); $d.SaveAs2("{docx_path.resolve()}", 16); $d.Close(); $w.Quit()'
+            subprocess.run(["powershell", "-NoProfile", "-Command", cmd], capture_output=True)
+        if docx_path.exists():
+            actual_file_to_open = str(docx_path)
+            
+    doc = docx.Document(actual_file_to_open)
     md_lines = []
     
     for p in doc.paragraphs:
@@ -204,11 +269,17 @@ def extract_file_content(file_path):
     else:
         return convert_text(file_path)
 
-def generate_summary(text, max_words=40):
+def generate_summary(text, max_words=60):
     """Gera uma ementa/síntese concisa e informativa do documento extraído."""
-    scope_match = re.search(r'(?:1\s+Scope|Clause 1\s+Scope|1\.\s+Scope)\s*\n+([^\n]+(?:\n+[^\n]+)?)', text, re.IGNORECASE)
+    scope_match = re.search(r'(?:1\s+Scope|Clause 1\s+Scope|1\.\s+Scope)\s*\n+([^\n]+(?:\n+[^\n]+){1,5})', text, re.IGNORECASE)
     if scope_match:
         scope_text = " ".join(scope_match.group(1).split())
+        sentences = re.split(r'(?<=[.!?])\s+', scope_text)
+        if sentences:
+            res = sentences[0]
+            if len(res.split()) < 25 and len(sentences) > 1:
+                res = f"{sentences[0]} {sentences[1]}"
+            return res
         words = scope_text.split()
         if len(words) > max_words:
             return " ".join(words[:max_words]) + "..."
@@ -221,7 +292,18 @@ def generate_summary(text, max_words=40):
         if not any(l.lower().startswith(p) for p in meta_prefixes) and len(l) > 15
     ]
     if informative_lines:
-        first_para = informative_lines[0]
+        para_lines = []
+        for l in informative_lines:
+            para_lines.append(l)
+            if l.endswith(('.', '!', '?')) or len(' '.join(para_lines).split()) >= 35:
+                break
+        first_para = " ".join(para_lines)
+        sentences = re.split(r'(?<=[.!?])\s+', first_para)
+        if sentences and len(sentences[0]) > 25:
+            res = sentences[0]
+            if len(res.split()) < 20 and len(sentences) > 1:
+                res = f"{sentences[0]} {sentences[1]}"
+            return res
         words = first_para.split()
         if len(words) > max_words:
             return " ".join(words[:max_words]) + "..."
@@ -346,7 +428,13 @@ def split_boundary_aware(content, max_lines=450, chunk1_reserve=60, other_reserv
     lines = content.splitlines()
     total_lines = len(lines)
     
-    if total_lines <= (max_lines - 10):
+    eff_c1_reserve = chunk1_reserve if max_lines > (chunk1_reserve + 20) else max(3, int(max_lines * 0.2))
+    eff_other_reserve = other_reserve if max_lines > (other_reserve + 20) else max(3, int(max_lines * 0.15))
+    
+    c1_limit = max(5, max_lines - eff_c1_reserve)
+    other_limit = max(5, max_lines - eff_other_reserve)
+    
+    if total_lines <= c1_limit:
         return [content]
         
     blocks = []
@@ -386,7 +474,7 @@ def split_boundary_aware(content, max_lines=450, chunk1_reserve=60, other_reserv
         
     chunks = []
     current_chunk = []
-    current_target_limit = max_lines - chunk1_reserve
+    current_target_limit = c1_limit
     
     for block in blocks:
         block_lines = len(block.splitlines())
@@ -394,11 +482,12 @@ def split_boundary_aware(content, max_lines=450, chunk1_reserve=60, other_reserv
             if current_chunk:
                 chunks.append("\n".join(current_chunk).strip())
                 current_chunk = []
-                current_target_limit = max_lines - other_reserve
+                current_target_limit = other_limit
             b_lines = block.splitlines()
-            for i in range(0, len(b_lines), current_target_limit):
-                slice_b = "\n".join(b_lines[i:i + current_target_limit])
-                if i + current_target_limit < len(b_lines):
+            step = max(5, current_target_limit)
+            for i in range(0, len(b_lines), step):
+                slice_b = "\n".join(b_lines[i:i + step])
+                if i + step < len(b_lines):
                     chunks.append(slice_b.strip())
                 else:
                     current_chunk = [slice_b]
@@ -409,7 +498,7 @@ def split_boundary_aware(content, max_lines=450, chunk1_reserve=60, other_reserv
         if test_lines > current_target_limit and current_chunk:
             chunks.append("\n".join(current_chunk).strip())
             current_chunk = [block]
-            current_target_limit = max_lines - other_reserve
+            current_target_limit = other_limit
         else:
             current_chunk.append(block)
             
@@ -426,37 +515,55 @@ def generate_executive_brief(content, base_name, title, parts_metadata, lang="en
     # 1. Escopo e Objetivo
     scope_text = generate_summary(content, max_words=60)
     
-    # 2. Extração de Regras Mandatórias ("shall / must")
+    # 2. Extração de Regras Mandatórias ("shall / must" ou "deve / deverá / obrigatório")
     mandatory_rules = []
     seen_rules = set()
     
-    # Termos e disclaimers administrativos/editoriais a desconsiderar
-    ignore_editorial_terms = [
-        "typeface", "typefaces", "embedded", "copyright", "photocopying", 
-        "permission", "licensee", "liability", "disclaimer", "iso copyright office",
-        "inhabitant", "adobe systems", "electronic retrieval", "published in switzerland"
-    ]
+    if lang == "eng-US":
+        ignore_editorial_terms = [
+            "typeface", "typefaces", "embedded", "copyright", "photocopying", 
+            "permission", "licensee", "liability", "disclaimer", "iso copyright office",
+            "inhabitant", "adobe systems", "electronic retrieval", "published in switzerland",
+            "patent", "patent rights"
+        ]
+        mandatory_pattern = re.compile(r'\b(?:shall|must)\b', re.IGNORECASE)
+    else:
+        ignore_editorial_terms = [
+            "copyright", "direitos reservados", "distribuição gratuita", "reprodução proibida",
+            "adobe systems", "licença", "aviso legal", "disclaimer", "todos os direitos reservados"
+        ]
+        mandatory_pattern = re.compile(r'\b(?:deve|deverá|deverão|obrigatório|obrigatória|obrigatórios|obrigatórias|proibido|proibida|veda-se|vedado|vedada|exige-se)\b', re.IGNORECASE)
     
     lines = content.splitlines()
-    current_clause = "General Requirements"
+    current_clause = "General Requirements" if lang == "eng-US" else "Requisitos Gerais"
     
     for line in lines:
         stripped = line.strip()
-        clause_match = re.match(r'^(?:#+\s*)?(?:Clause|Section)?\s*([A-Za-z0-9]+(?:\.[0-9]+)+|[A-Z]\.\d+)\s+([A-Za-z0-9\s,–—\-_/()]+)', stripped)
+        if stripped.startswith("#"):
+            h_text = stripped.lstrip("#").strip()
+            h_clean = re.sub(r'[*_`]', '', h_text)
+            if h_clean and len(h_clean) > 3:
+                current_clause = h_clean[:55]
+                continue
+
+        clause_match = re.match(r'^(?:#+\s*)?(?:(?:Clause|Section|Artigo|Art\.|Item|Seção|Capítulo|Tabela|Anexo)\s+([A-Za-z0-9]+(?:\.[0-9]+)*|[A-Z]\b)|([0-9]+(?:\.[0-9]+)+|[A-Z]\.\d+))\s+([A-Za-z0-9\s,–—\-_/()]+)', stripped, re.IGNORECASE)
         if clause_match:
-            current_clause = f"Clause {clause_match.group(1)} ({clause_match.group(2).strip()})"
+            c_num = clause_match.group(1) or clause_match.group(2)
+            c_name = clause_match.group(3).strip() if clause_match.group(3) else ""
+            prefix = "Clause" if lang == "eng-US" else "Seção"
+            current_clause = f"{prefix} {c_num} ({c_name})" if c_name else f"{prefix} {c_num}"
             if len(current_clause) > 55:
                 current_clause = current_clause[:52] + "..."
             continue
             
         stripped_lower = stripped.lower()
-        if "shall" in stripped_lower or "must" in stripped_lower:
+        if mandatory_pattern.search(stripped_lower):
             if any(term in stripped_lower for term in ignore_editorial_terms):
                 continue
             sentences = re.split(r'\.\s+', stripped)
             for s in sentences:
                 s_lower = s.lower()
-                if ("shall" in s_lower or "must" in s_lower) and not any(term in s_lower for term in ignore_editorial_terms):
+                if mandatory_pattern.search(s_lower) and not any(term in s_lower for term in ignore_editorial_terms):
                     s_clean = s.strip().rstrip('.')
                     s_clean = re.sub(r'^[-–—*•\s]+', '', s_clean)
                     s_clean = re.sub(r'^/g\d+\s*', '', s_clean)
@@ -468,19 +575,73 @@ def generate_executive_brief(content, base_name, title, parts_metadata, lang="en
         if len(mandatory_rules) >= 12:
             break
             
-    # 3. Matriz Léxica Remissiva com conceitos-chave
-    core_concepts = [
-        ("SyRS", "System Requirements Specification", [r'\bSyRS\b', r'System Requirements Specification']),
-        ("StRS", "Stakeholder Requirements Specification", [r'\bStRS\b', r'Stakeholder Requirements Specification']),
-        ("OpsCon", "System Operational Concept Document", [r'\bOpsCon\b', r'Operational Concept']),
-        ("ConOps", "Concept of Operations Document", [r'\bConOps\b', r'Concept of Operations']),
-        ("ICD", "Interface Control Document & Boundaries", [r'\bICD\b', r'Interface Control Document', r'Interface Requirements']),
-        ("Verification", "Requirements Verification Process and Criteria", [r'Verification Process', r'Requirement Verification', r'Verification Criteria', r'\bVerification\b']),
-        ("Validation", "Requirements Validation Process", [r'Validation Process', r'Requirement Validation', r'\bValidation\b']),
-        ("Stakeholders", "Stakeholder Identification and Requirements Elicitation", [r'Stakeholder Identification', r'Stakeholder Requirements Definition Process', r'\bStakeholder\b']),
-        ("Architecture", "System Architecture Allocation and Synthesis", [r'Architecture Design Process', r'Architecture Definition', r'Allocation', r'\bArchitecture\b']),
-        ("Tailoring", "Tailoring Policies and Standards Conformance", [r'\bTailoring\b', r'Annex D\b'])
-    ]
+    # 3. Matriz Léxica Remissiva com conceitos-chave de acordo com o domínio
+    base_lower = base_name.lower()
+    if base_lower.startswith("iso_") or "15288" in base_lower:
+        core_concepts = [
+            ("SyRS", "System Requirements Specification", [r'\bSyRS\b', r'System Requirements Specification']),
+            ("StRS", "Stakeholder Requirements Specification", [r'\bStRS\b', r'Stakeholder Requirements Specification']),
+            ("OpsCon", "System Operational Concept Document", [r'\bOpsCon\b', r'Operational Concept']),
+            ("ConOps", "Concept of Operations Document", [r'\bConOps\b', r'Concept of Operations']),
+            ("ICD", "Interface Control Document & Boundaries", [r'\bICD\b', r'Interface Control Document', r'Interface Requirements']),
+            ("Verification", "Requirements Verification Process and Criteria", [r'Verification Process', r'Requirement Verification', r'Verification Criteria', r'\bVerification\b']),
+            ("Validation", "Requirements Validation Process", [r'Validation Process', r'Requirement Validation', r'\bValidation\b']),
+            ("Stakeholders", "Stakeholder Identification and Requirements Elicitation", [r'Stakeholder Identification', r'Stakeholder Requirements Definition Process', r'\bStakeholder\b']),
+            ("Architecture", "System Architecture Allocation and Synthesis", [r'Architecture Design Process', r'Architecture Definition', r'Allocation', r'\bArchitecture\b']),
+            ("Tailoring", "Tailoring Policies and Standards Conformance", [r'\bTailoring\b', r'Annex D\b'])
+        ]
+    elif base_lower.startswith("layout_") or "atuarial" in base_lower:
+        core_concepts = [
+            ("Arquivos A01 a A12", "Especificação detalhada dos arquivos de dados da avaliação atuarial", [r'A01', r'A02', r'A03', r'A12', r'Arquivos de Dados']),
+            ("TB_HEADER", "Definição do registro de cabeçalho e controle de remessa", [r'TB_HEADER', r'HEADER', r'Registro de Cabeçalho']),
+            ("Tabelas Auxiliares", "Tabelas de domínio, motivos de desligamento e códigos", [r'Tabela Auxiliar', r'Tabelas Auxiliares', r'T01', r'T02', r'T03', r'Tabela de Domínio']),
+            ("Massa de Segurados", "Definição de militares ativos, inativos e dependentes", [r'Massa', r'Massa de Segurados', r'Ativo', r'Inativo', r'Pensionista', r'Dependente']),
+            ("Regras de Consistência", "Validação de tipos de dados, tamanhos e coerência cadastral", [r'Consistência', r'Validação', r'Crítica']),
+            ("Teto Remuneratório", "Limites constitucionais e regras de abate-teto", [r'Teto', r'Constitucional', r'Abate-teto']),
+            ("Campos Obrigatórios", "Requisitos de obrigatoriedade de preenchimento", [r'Obrigatório', r'Preenchimento']),
+            ("Datas e Prazos", "Formatação de datas e prazos de entrega do ciclo", [r'Data', r'Prazo', r'Ciclo'])
+        ]
+    elif base_lower.startswith("manual_do_bieg") or "bieg" in base_lower:
+        core_concepts = [
+            ("Comitê Gestor & Governança", "Atribuições, governança e fluxo de carga do BIEG no Ministério da Defesa", [r'Comitê Gestor', r'Governança', r'Ministério da Defesa', r'DEPES']),
+            ("TB_HEADER", "Especificação do layout do cabeçalho de remessa e totalizadores de carga", [r'TB_HEADER', r'HEADER', r'TOT_REGS_GRAV']),
+            ("Gabarito Pessoal (Anexo A)", "Modelagem cadastral de ativos, inativos, pensionistas, dependentes e anistiados", [r'TB_ATIVOS', r'TB_INATIVOS', r'TB_PENSIONISTAS', r'TB_ANISTIADOS', r'Grupo Pessoal']),
+            ("Gabarito Financeiro (Anexo B)", "Tabelas de lançamentos financeiros, outras despesas e rubricas remuneratórias", [r'TB_LANCAMENTOS_FINANCEIROS', r'TB_OUTRAS_DESPESAS', r'Grupo Financeiro']),
+            ("Gabarito Histórico (Anexo C)", "Registros da carreira militar, eventos funcionais, interstícios e movimentações", [r'HS_MILITARES', r'HS_EVENTOS', r'TB_INTERSTICIO', r'Grupo Histórico']),
+            ("Correspondência SIAFI (Anexo E)", "Mapeamento entre parcelas do BIEG e Naturezas de Despesa (ND) do SIAFI", [r'SIAFI', r'Natureza de Despesa', r'Relação Parcela', r'Enquadramento Legal']),
+            ("Crítica de Dados (Anexo F)", "Rotinas automatizadas de validação, integridade referencial e regras impeditivas", [r'Crítica', r'Rotinas de Crítica', r'Inconsistência', r'Validação'])
+        ]
+    elif base_lower.startswith("email_casnav") or "casnav" in base_lower:
+        core_concepts = [
+            ("Acórdão TCU 1358/2026", "Decisões e apontamentos do Tribunal de Contas da União", [r'1358', r'Acórdão', r'TCU']),
+            ("Críticas CASNAV", "Conjunto de 47 regras de validação cadastral e atuarial", [r'Crítica', r'47', r'Validaç']),
+            ("Remuneração e Tetos", "Auditoria de valores remuneratórios e limites legais", [r'Remuneraç', r'Teto', r'Vencimento']),
+            ("Consistência Cadastral", "Coerência de CPF, datas de nascimento e vínculos", [r'CPF', r'Cadastral', r'Nascimento']),
+            ("Prazos e Providências", "Determinações e prazos para saneamento das inconsistências", [r'Prazo', r'Providência', r'Determinaç'])
+        ]
+    elif base_lower.startswith("manual_marca") or "marca" in base_lower:
+        core_concepts = [
+            ("Marca Exército Brasileiro", "Diretrizes e uso institucional da marca EB", [r'Marca', r'Exército Brasileiro', r'Identidade']),
+            ("Brasão das Armas", "Símbolo heráldico nacional e regras de reprodução", [r'Brasão das Armas', r'Brasão']),
+            ("Cores Institucionais", "Paleta cromática oficial e especificações CMYK/RGB", [r'Cores', r'CMYK', r'Pantone', r'RGB']),
+            ("Tipografia Oficial", "Famílias tipográficas padronizadas para comunicações", [r'Tipografia', r'Fonte', r'Letras']),
+            ("Área de Não Interferência", "Margem mínima de isolamento visual da marca", [r'Não Interferência', r'Margem', r'Isolamento']),
+            ("Proibições de Uso", "Vedações expressas de alteração, distorção ou uso indevido", [r'Proibiç', r'Veda', r'Incorreto'])
+        ]
+    else:
+        extracted_terms = []
+        seen_terms = set()
+        for p_meta in parts_metadata:
+            for top in p_meta.get("topics_list", []):
+                top_clean = re.sub(r'^[0-9\.\s]+', '', top).strip()
+                if top_clean and len(top_clean) > 3 and top_clean.lower() not in seen_terms:
+                    seen_terms.add(top_clean.lower())
+                    extracted_terms.append((top_clean, f"Tópico normativo: {top_clean}", [re.escape(top_clean)]))
+                if len(extracted_terms) >= 8:
+                    break
+            if len(extracted_terms) >= 8:
+                break
+        core_concepts = extracted_terms if extracted_terms else [("Requisitos", "Requisitos e diretrizes normativas", [r'requisito', r'norma'])]
     
     lexicon_matrix = []
     for item in core_concepts:
@@ -497,7 +658,7 @@ def generate_executive_brief(content, base_name, title, parts_metadata, lang="en
             
             score = 0
             
-            is_defs = any("terms and definition" in t.lower() for t in p_meta.get("topics_list", [])) or "terms and definition" in chunk_text[:300].lower()
+            is_defs = any("terms and definition" in t.lower() or "termos e definições" in t.lower() for t in p_meta.get("topics_list", [])) or "terms and definition" in chunk_text[:300].lower()
             if p_num == 1:
                 score -= 40
             if is_defs:
@@ -519,6 +680,7 @@ def generate_executive_brief(content, base_name, title, parts_metadata, lang="en
             
         part_scores.sort(key=lambda x: x[0], reverse=True)
         
+        fallback_link = f"[Part 01](./{base_name}_01.md)" if lang == "eng-US" else f"[Parte 01](./{base_name}_01.md)"
         if part_scores and part_scores[0][0] > 0:
             top_score, top_meta = part_scores[0]
             recommended_parts = [top_meta]
@@ -527,45 +689,95 @@ def generate_executive_brief(content, base_name, title, parts_metadata, lang="en
                 second_score, second_meta = part_scores[1]
                 recommended_parts = sorted([top_meta, second_meta], key=lambda x: x["part_number"])
                 
-            links_str = ", ".join([f"[Part {pm['part_number']:02d}]({pm['relative_path']})" for pm in recommended_parts])
+            part_prefix = "Part" if lang == "eng-US" else "Parte"
+            links_str = ", ".join([f"[{part_prefix} {pm['part_number']:02d}]({pm['relative_path']})" for pm in recommended_parts])
             lexicon_matrix.append((term, desc, links_str))
         else:
-            lexicon_matrix.append((term, desc, f"[Part 01](./{base_name}_01.md)"))
+            lexicon_matrix.append((term, desc, fallback_link))
 
     out = []
-    out.append(f"# {doc_title} - Executive Brief & Normative Core\n")
-    out.append(f"> **Document Family:** `{base_name}` | **Factored Parts:** {num_parts}")
-    out.append("> **Tier:** 1 (Executive Summary, Normative Mandates & Lexicon Matrix)\n")
-    out.append("---\n")
-    
-    out.append("## Agent Fast Retrieval Protocol")
-    out.append("1. **Zero-Overhead Decision Making:** Consult the Mandatory Rules below before reading deep text parts.")
-    out.append("2. **Surgical Deep Dives:** Use the Lexicon Matrix below to navigate directly to the specific factored part.")
-    out.append("3. **CLI Precision Search:** Execute `python convert_to_md.py --query \"<term>\" <dir>` for exact clause snippets with line numbers.\n")
-    out.append("---\n")
-    
-    out.append("## 1. Scope & Primary Objectives")
-    out.append(f"{scope_text}\n")
-    
-    out.append("## 2. Core Mandatory Rules ('Shall / Must' Principles)")
-    if mandatory_rules:
-        for clause, rule in mandatory_rules:
-            out.append(f"*   **[{clause}]:** {rule}.")
+    if lang == "eng-US":
+        out.append(f"# {doc_title} - Executive Brief & Normative Core\n")
+        out.append(f"> **Document Family:** `{base_name}` | **Factored Parts:** {num_parts}")
+        out.append("> **Tier:** 1 (Executive Summary, Normative Mandates & Lexicon Matrix)\n")
+        out.append("---\n")
+        out.append("## Agent Fast Retrieval Protocol")
+        out.append("1. **Zero-Overhead Decision Making:** Consult the Mandatory Rules below before reading deep text parts.")
+        out.append("2. **Surgical Deep Dives:** Use the Lexicon Matrix below to navigate directly to the specific factored part.")
+        out.append("3. **CLI Precision Search:** Execute `python convert_to_md.py --query \"<term>\" <dir>` for exact clause snippets with line numbers.\n")
+        out.append("---\n")
+        out.append("## 1. Scope & Primary Objectives")
+        out.append(f"{scope_text}\n")
+        out.append("## 2. Core Mandatory Rules ('Shall / Must' Principles)")
+        if mandatory_rules:
+            for clause, rule in mandatory_rules:
+                out.append(f"*   **[{clause}]:** {rule}.")
+        else:
+            out.append("*   *Note: This reference artifact contains standard preview / introductory clauses (Scope, Normative References, and Terms/Definitions). Complete mandatory process requirements ('shall') are defined in clauses 4 through 6 of the full standard.*")
+        out.append("")
+        out.append("## 3. Key Deliverables & Process Artifacts")
+        out.append("| Artifact | Purpose | Primary Focus |")
+        out.append("| --- | --- | --- |")
+        out.append("| **StRS** | Stakeholder Requirements Specification | User needs, operating concepts, constraints |")
+        out.append("| **SyRS** | System Requirements Specification | Technical system functions, interfaces, verification |")
+        out.append("| **OpsCon** | Operational Concept Document | Operational scenarios, modes, user classes |")
+        out.append("| **ICD** | Interface Control Document | Internal and external system boundaries |\n")
+        out.append("## 4. Lexicon & Terminology Mapping Matrix")
+        out.append("| Term / Concept | Description | Target Factored Part |")
+        out.append("| --- | --- | --- |")
     else:
-        out.append("*   All processes and requirements engineering activities defined in this standard must be verified against stakeholder criteria.")
-    out.append("")
-    
-    out.append("## 3. Key Deliverables & Process Artifacts")
-    out.append("| Artifact | Purpose | Primary Focus |")
-    out.append("| --- | --- | --- |")
-    out.append("| **StRS** | Stakeholder Requirements Specification | User needs, operating concepts, constraints |")
-    out.append("| **SyRS** | System Requirements Specification | Technical system functions, interfaces, verification |")
-    out.append("| **OpsCon** | Operational Concept Document | Operational scenarios, modes, user classes |")
-    out.append("| **ICD** | Interface Control Document | Internal and external system boundaries |\n")
-    
-    out.append("## 4. Lexicon & Terminology Mapping Matrix")
-    out.append("| Term / Concept | Description | Target Factored Part |")
-    out.append("| --- | --- | --- |")
+        out.append(f"# {doc_title} - Resumo Executivo & Núcleo Normativo\n")
+        out.append(f"> **Família Normativa:** `{base_name}` | **Partes Fatoradas:** {num_parts}")
+        out.append("> **Tier:** 1 (Resumo Executivo, Mandatos Normativos & Matriz Léxica)\n")
+        out.append("---\n")
+        out.append("## Protocolo de Recuperação Rápida para Agentes")
+        out.append("1. **Tomada de Decisão com Sobrecarga Zero:** Consulte as Regras Mandatórias abaixo antes de ler as partes completas de texto.")
+        out.append("2. **Navegação Cirúrgica:** Utilize a Matriz Léxica abaixo para navegar diretamente à parte fatorada correspondente.")
+        out.append("3. **Busca CLI de Alta Precisão:** Execute `python convert_to_md.py --query \"<termo>\" <dir>` para snippets exatos com números de linha.\n")
+        out.append("---\n")
+        out.append("## 1. Escopo & Objetivos Principais")
+        out.append(f"{scope_text}\n")
+        out.append("## 2. Regras Mandatórias Principais (Princípios 'Deve / Deverá / Obrigatório')")
+        if mandatory_rules:
+            for clause, rule in mandatory_rules:
+                out.append(f"*   **[{clause}]:** {rule}.")
+        else:
+            out.append("*   Todos os processos, tabelas e requisitos definidos neste normativo devem ser estritamente cumpridos e verificados.")
+        out.append("")
+        out.append("## 3. Principais Entregáveis e Estruturas de Dados")
+        out.append("| Estrutura / Artefato | Finalidade | Foco Principal |")
+        out.append("| --- | --- | --- |")
+        if base_lower.startswith("layout_") or "atuarial" in base_lower:
+            out.append("| **Arquivos A01 a A12** | Dados cadastrais e financeiros | Militares da ativa, inativos, pensionistas e dependentes |")
+            out.append("| **Tabelas Auxiliares** | Codificação e domínios padronizados | Motivos de desligamento, parentesco e postos/graduações |")
+            out.append("| **TB_HEADER** | Registro inicial de controle e metadados | Identificação da Força, ano-base, versão do layout e totais |")
+            out.append("| **Gabaritos de Validação** | Regras de tipagem e limites | Consistência de campos, formatos e tetos remuneratórios |\n")
+        elif base_lower.startswith("manual_do_bieg") or "bieg" in base_lower:
+            out.append("| **Manual Base (Histórico)** | Histórico, governança e fluxo de carga | Banco de Informações Estratégicas e Gerenciais das Forças Armadas |")
+            out.append("| **Anexo A (Dados Pessoais)** | Modelagem cadastral das massas | TB_ATIVOS, TB_INATIVOS, TB_PENSIONISTAS, TB_ANISTIADOS, OMs e Quadros |")
+            out.append("| **Anexo B (Dados Financeiros)** | Estruturas de remuneração e custos | TB_LANCAMENTOS_FINANCEIROS, TB_OUTRAS_DESPESAS e rubricas |")
+            out.append("| **Anexo C (Dados Históricos)** | Evolução da carreira militar | HS_MILITARES, HS_EVENTOS, TB_INTERSTICIO e promoções/movimentações |")
+            out.append("| **Anexo D (Tabela TB_HEADER)** | Cabeçalho e controle de remessas | Totalizadores de registros gravados por tabela (01 a 20) |")
+            out.append("| **Anexo E (Correspondência SIAFI)** | Mapeamento de parcelas e despesas | Relação Parcela BIEG x ND-2 para Ativos, Inativos, Pensionistas e Anistiados |")
+            out.append("| **Anexo F (Crítica de Dados)** | Regras de validação e consistência | Consultas automatizadas, integridade referencial e controle de carga |\n")
+        elif base_lower.startswith("email_casnav") or "casnav" in base_lower:
+            out.append("| **Acórdão TCU nº 1358/2026** | Deliberação plenária do TCU | Determinações e prazos para saneamento dos dados atuariais |")
+            out.append("| **Matriz de 47 Críticas** | Regras automatizadas do CASNAV | Auditoria de integridade, vínculos e coerência financeira |")
+            out.append("| **Arquivo de Divergências** | Relatório de inconsistências | Códigos de rejeição e motivos de erro em remessas |")
+            out.append("| **Validação Remuneratória** | Verificação de limites e parcelas | Controle de extrapolação de teto e parcelas indevidas |\n")
+        elif base_lower.startswith("manual_marca") or "marca" in base_lower:
+            out.append("| **Portaria nº 885 - Cmt Ex** | Ato normativo instituidor | Regulamentação oficial do uso da marca Exército Brasileiro |")
+            out.append("| **Brasão das Armas e Símbolos** | Símbolos heráldicos oficiais | Proporções, versões policromáticas e monocráticas |")
+            out.append("| **Ativos Gráficos (.png)** | Biblioteca visual padronizada | Aplicação em sistemas, publicações e mídias institucionais |")
+            out.append("| **Normas de Aplicação** | Regras de integridade visual | Áreas de não interferência, dimensões mínimas e vedações |\n")
+        else:
+            out.append("| **Especificação Principal** | Documento normativo de referência | Diretrizes técnicas e requisitos operacionais |")
+            out.append("| **Tabelas e Registros** | Estruturas de dados associadas | Modelagem de campos e formatos |")
+            out.append("| **Critérios de Validação** | Regras de consistência e auditoria | Verificação de conformidade e integridade |\n")
+        out.append("## 4. Matriz Léxica Remissiva e Mapeamento de Tópicos")
+        out.append("| Termo / Conceito | Descrição | Parte Fatorada Alvo |")
+        out.append("| --- | --- | --- |")
+        
     for term, desc, part_link in lexicon_matrix:
         out.append(f"| **{term}** | {desc} | {part_link} |")
     out.append("")
@@ -577,11 +789,11 @@ def generate_executive_brief(content, base_name, title, parts_metadata, lang="en
         brief_content = "\n".join(brief_lines[:298]) + "\n\n*(Truncated to comply with strict 300-line executive limit)*\n"
     return brief_content
 
-def split_and_save_markdown(content, target_dir, base_name, max_lines=450, lang="eng-US"):
+def split_and_save_markdown(content, target_dir, base_name, title=None, max_lines=450, lang="eng-US"):
     """Divide o conteúdo com particionamento boundary-aware, frontmatter YAML e gera executive brief."""
     target_path = Path(target_dir)
     target_path.mkdir(parents=True, exist_ok=True)
-    doc_title = base_name.replace('_', ' ').title()
+    doc_title = title or base_name.replace('_', ' ').title()
     
     lines = content.splitlines()
     total_lines = len(lines)
@@ -607,8 +819,13 @@ def split_and_save_markdown(content, target_dir, base_name, max_lines=450, lang=
             ]
         }
         
-    # Fatoração Boundary-Aware
-    chunks = split_boundary_aware(content, max_lines=max_lines, chunk1_reserve=60, other_reserve=40)
+    # Fatoração Boundary-Aware com dimensionamento dinâmico da reserva para o índice da Parte 01
+    initial_chunks = split_boundary_aware(content, max_lines=max_lines, chunk1_reserve=60, other_reserve=40)
+    needed_c1_reserve = max(60, len(initial_chunks) + 35)
+    if needed_c1_reserve > 60:
+        chunks = split_boundary_aware(content, max_lines=max_lines, chunk1_reserve=needed_c1_reserve, other_reserve=40)
+    else:
+        chunks = initial_chunks
     num_parts = len(chunks)
     
     # Extração de Metadados de cada parte
@@ -878,7 +1095,7 @@ def search_reference_catalog(catalog_dir, query_term, max_results=3):
         if f.name.startswith("index"):
             continue
         try:
-            content = f.read_text(encoding="utf-8")
+            content = f.read_text(encoding="utf-8", errors="replace").lstrip('\ufeff')
         except Exception:
             continue
             
@@ -955,16 +1172,16 @@ def main():
             
         cleaned_content = clean_markdown_content(content)
         summary = generate_summary(cleaned_content)
+        doc_title = args.title or base_name.replace('_', ' ').title()
         
         save_result = split_and_save_markdown(
             cleaned_content,
             args.target_dir,
             base_name,
+            title=doc_title,
             max_lines=args.max_lines,
             lang=args.lang
         )
-        
-        doc_title = args.title or base_name.replace('_', ' ').title()
         
         index_result = None
         if args.update_index:
